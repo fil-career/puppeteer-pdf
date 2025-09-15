@@ -30,7 +30,6 @@ if (!dbConnection) {
 const browser = await createBrowser();
 
 const students = await getStudents(dbConnection, 10);
-console.log(students);process.exit(1);
 
 
 for (const student of students) {
