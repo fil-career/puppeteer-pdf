@@ -3,9 +3,10 @@ import mysql from "mysql2/promise";
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from 'url';
-import { dirname as _dirname } from 'path';
+import { fileURLToPath } from "url";
+import { dirname as _dirname } from "path";
 import links from "./form-links.js";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = _dirname(__filename);
 dotenv.config();
@@ -18,35 +19,35 @@ if (!PHPSESSID) {
   process.exit(1);
 }
 
+let browser;
+let dbConnection;
 
-// create a db connection
-const dbConnection = await createDBConnection();
-if (!dbConnection) {
-  console.error("❌ Failed to establish database connection.");
-  process.exit(1);
-}
+try {
+  // create a db connection
+  dbConnection = await createDBConnection();
+  if (!dbConnection) throw new Error("Failed to connect to DB");
 
-// create a browser instance
-const browser = await createBrowser();
+  // create a browser instance
+  browser = await createBrowser();
 
-const students = await getStudents(dbConnection, 10);
+  const students = await getStudents(dbConnection, 100);
 
-
-for (const student of students) {
-  const { stud_id, year, name, program, file_names } = student;
-  try {
-    await generatePDF(browser, stud_id, year, name, program, file_names);
-  } catch (error) {
-    console.error("❌ Error generating PDF:", error);
-    process.exit(1);
+  for (const student of students) {
+    const { stud_id, year, name, program, file_names } = student;
+    try {
+      await generatePDF(browser, stud_id, year, name, program, file_names);
+    } catch (error) {
+      console.error(`❌ Error generating PDF for student ${stud_id}:`, error.message);
+      continue; // skip and go to next student
+    }
   }
+} catch (err) {
+  console.error("❌ Fatal error:", err.message);
+} finally {
+  if (browser) await browser.close();
+  if (dbConnection) await dbConnection.end();
+  process.exit(0);
 }
-
-// close the browser and db connection after all students are processed
-process.on('beforeExit', async () => {
-  await browser.close();
-  await dbConnection.end();
-});
 
 async function generatePDF(browser, stud_id, year, name, program, file_names) {
   let files = links[year];
@@ -55,7 +56,7 @@ async function generatePDF(browser, stud_id, year, name, program, file_names) {
     return;
   }
 
-  files = files.filter(file => file_names.includes(file.file_name));
+  files = files.filter((file) => file_names.includes(file.file_name));
   if (files.length === 0) {
     console.log(`ℹ️ No new files to generate for student ID ${stud_id} for year ${year}.`);
     return;
@@ -72,44 +73,51 @@ async function generatePDF(browser, stud_id, year, name, program, file_names) {
         httpOnly: true,
         secure: false,
       });
+
       const url = `${process.env.BASE_URL}/${file.url}?stud_id=${stud_id}`;
       console.log("📄 Generating PDF for:", url);
 
-      await page.goto(url, { waitUntil: "networkidle2", timeout: 0 });
+      // safer navigation with timeout
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
+      // wait for images, but max 10s
       await page.evaluate(async () => {
+        const timeout = new Promise((resolve) => setTimeout(resolve, 10000));
         const images = Array.from(document.images);
-        await Promise.all(
-          images.map((img) => {
-            if (img.complete) return;
-            return new Promise((resolve) => {
-              img.onload = img.onerror = resolve;
-            });
-          })
-        );
+        const loaders = images.map((img) => {
+          if (img.complete) return Promise.resolve();
+          return new Promise((resolve) => {
+            img.onload = img.onerror = resolve;
+          });
+        });
+        await Promise.race([Promise.all(loaders), timeout]);
       });
 
       const outputDir = path.join(
         __dirname,
         `output/${program.replace(/[^a-zA-Z0-9]/g, "_")}/${year}/${stud_id}_${name.replace(/[^a-zA-Z0-9]/g, "_")}`
       );
-
       if (!fs.existsSync(outputDir)) {
         fs.mkdirSync(outputDir, { recursive: true });
       }
 
-      await page.pdf({
-        path: path.join(
-          outputDir,
-          `${stud_id}_${file.file_name.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase()}.pdf`
+      const pdfPath = path.join(
+        outputDir,
+        `${stud_id}_${file.file_name.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase()}.pdf`
+      );
+
+      // protect PDF generation with timeout
+      await Promise.race([
+        page.pdf({
+          path: pdfPath,
+          format: "A4",
+          printBackground: true,
+          margin: { bottom: "1cm", top: "1cm" },
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("PDF generation timeout")), 30000)
         ),
-        format: "A4",
-        printBackground: true,
-        margin: {
-          bottom: "1cm",
-          top: "1cm",
-        },
-      });
+      ]);
 
       await logPDFGeneration(dbConnection, stud_id, name, program, year, url, file.file_name);
     } finally {
@@ -119,31 +127,30 @@ async function generatePDF(browser, stud_id, year, name, program, file_names) {
 }
 
 async function createBrowser() {
-  const browser = await puppeteer.launch({
+  return await puppeteer.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--mute-audio"],
   });
-  return browser;
 }
 
 async function createDBConnection() {
-    try {
-      const connection = await mysql.createConnection({
-        host: process.env.DB_HOST,
-        user: process.env.DB_USER,
-        password: process.env.DB_PASSWORD,
-        database: process.env.DB_NAME,
-        namedPlaceholders: true,
-      });
-      return connection;
-    } catch (error) {
-      console.error("❌ Error establishing database connection:", error);
-      return false;
-    }
+  try {
+    return await mysql.createConnection({
+      host: process.env.DB_HOST,
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+      database: process.env.DB_NAME,
+      namedPlaceholders: true,
+      connectTimeout: 10000, // 10s
+    });
+  } catch (error) {
+    console.error("❌ Error establishing database connection:", error.message);
+    return false;
+  }
 }
 
 async function getStudents(connection, limit = 1) {
-  const fileNames = links[PROGRAM_YEAR].map(file => `'${file.file_name}'`).join(", ");
+  const fileNames = links[PROGRAM_YEAR].map((file) => `'${file.file_name}'`).join(", ");
   try {
     const [rows] = await connection.execute(`
       SELECT 
@@ -153,40 +160,41 @@ async function getStudents(connection, limit = 1) {
         st.account_year as year,
         group_concat(aa2.file_name) as file_names
       FROM student_tb st
-      left join application_answers aa on aa.stud_id = st.stud_id and aa.file_name = 'application'
-      left join application_answers aa2 on aa2.stud_id = st.stud_id 
-        and aa2.file_name not in (select file_name from pdf_generated where stud_id = st.stud_id ) 
-        and aa2.file_name in (${fileNames})
-      where aa.a68 in ('DESC', 'Connect Detroit')
-      and aa2.file_name != '' 
-      and st.account_year = 2021 
-      group by st.stud_id
-      order by st.stud_id
-      limit ${limit};
+      LEFT JOIN application_answers aa 
+        ON aa.stud_id = st.stud_id 
+        AND aa.file_name = 'application'
+      LEFT JOIN application_answers aa2 
+        ON aa2.stud_id = st.stud_id 
+        AND aa2.file_name NOT IN (
+          SELECT file_name FROM pdf_generated WHERE stud_id = st.stud_id
+        )
+        AND aa2.file_name IN (${fileNames})
+      WHERE aa.a68 IN ('DESC', 'Connect Detroit')
+      AND aa2.file_name != '' 
+      AND st.account_year = ${PROGRAM_YEAR}
+      GROUP BY st.stud_id
+      ORDER BY st.stud_id
+      LIMIT ${limit};
     `);
     return rows;
   } catch (error) {
-    console.error("❌ Error fetching students:", error);
-    return false;
+    console.error("❌ Error fetching students:", error.message);
+    return [];
   }
 }
 
 async function logPDFGeneration(connection, stud_id, name, program, year, link, file_name) {
   try {
-    await connection.execute(`
+    await connection.execute(
+      `
       INSERT INTO pdf_generated (stud_id, name, program, year, link, file_name)
       VALUES (:stud_id, :name, :program, :year, :link, :file_name)
-    `, {
-      stud_id,
-      name,
-      program,
-      year,
-      link,
-      file_name
-    });
+    `,
+      { stud_id, name, program, year, link, file_name }
+    );
     return true;
   } catch (error) {
-    console.error("❌ Error logging PDF generation:", error);
+    console.error("❌ Error logging PDF generation:", error.message);
     return false;
   }
 }
