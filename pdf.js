@@ -30,7 +30,7 @@ try {
   // create a browser instance
   browser = await createBrowser();
 
-  const students = await getStudents(dbConnection, 100);
+  const students = await getStudents(dbConnection, 1);
 
   for (const student of students) {
     const { stud_id, year, name, program, file_names } = student;
@@ -80,8 +80,11 @@ async function generatePDF(browser, stud_id, year, name, program, file_names) {
       // safer navigation with timeout
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-      // wait for images, but max 10s
+      // Remove all hrefs from anchor tags and wait for images, but max 10s
       await page.evaluate(async () => {
+        // Remove all href attributes from anchor tags
+        document.querySelectorAll('a[href]').forEach(a => a.removeAttribute('href'));
+
         const timeout = new Promise((resolve) => setTimeout(resolve, 10000));
         const images = Array.from(document.images);
         const loaders = images.map((img) => {
